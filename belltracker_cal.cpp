@@ -17,6 +17,8 @@
 // ── debug instrumentation ─────────────────────────────────────────────────────
 bool g_debug = false;
 
+static void midi_to_name(int midi, char* out, size_t n);  // defined below
+
 static const char* cal_state_name(CalSubState s) {
     switch (s) {
     case CalSubState::AWAITING_STRIKE:      return "AWAITING_STRIKE";
@@ -174,8 +176,9 @@ bool BellTracker::init(const std::string& load_cal_path,
                    n_bells_, load_cal_path.c_str());
             for (int i = 0; i < n_bells_; ++i) {
                 const char* ts = (bells_[i].type == InstrumentType::BELL) ? "bell" : "chime";
-                printf("  %2d: %.2f Hz  MIDI %3d  ch %d  [%s]\n",
-                       i+1, bells_[i].freq_hz, bells_[i].midi_note,
+                char nn[8]; midi_to_name(bells_[i].midi_note, nn, sizeof(nn));
+                printf("  %2d: %.2f Hz  MIDI %3d (%-3s)  ch %d  [%s]\n",
+                       i+1, bells_[i].freq_hz, bells_[i].midi_note, nn,
                        bell_channel(i), ts);
             }
             // audible cue — headless deployment, console isn't visible.
@@ -684,8 +687,9 @@ void BellTracker::finalize_cal() {
     for (int i = 0; i < n_bells_; ++i) {
         bells_[i].goertzel.init(bells_[i].freq_hz, GOERTZEL_WINDOW);
         const char* ts = (bells_[i].type == InstrumentType::BELL) ? "bell" : "chime";
-        printf("  %2d: %.2f Hz  MIDI %3d  ch %d  [%s]\n",
-               i+1, bells_[i].freq_hz, bells_[i].midi_note, bell_channel(i), ts);
+        char nn[8]; midi_to_name(bells_[i].midi_note, nn, sizeof(nn));
+        printf("  %2d: %.2f Hz  MIDI %3d (%-3s)  ch %d  [%s]\n",
+               i+1, bells_[i].freq_hz, bells_[i].midi_note, nn, bell_channel(i), ts);
         (bells_[i].type == InstrumentType::BELL) ? ++nb : ++nc;
     }
     printf("  %d bell(s), %d chime(s)\n", nb, nc);
