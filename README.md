@@ -1,0 +1,353 @@
+# belltracker
+
+Real-time handbell and choirchime MIDI detection and recording for Raspberry Pi + Steinberg UR22mkII.
+
+Captures live audio from a microphone or direct input, identifies each bell or chime strike by pitch and instrument type, and outputs MIDI note events in real time via the UR22mkII's DIN MIDI output. Also records the full performance to a WAV file on a USB drive if one is present. Designed to run entirely headless — no display, no keyboard, no mouse. All operator feedback is delivered through MIDI.
+
+See **GUIDE.md** for operator instructions (no technical background required).
+
+---
+
+## Hardware
+
+| Item | Notes |
+|---|---|
+| Raspberry Pi 4 or 5 | Pi 5 users: update `-march`/`-mtune` flags in CMakeLists.txt (`cortex-a76`) |
+| Steinberg UR22mkII | USB audio interface; provides audio input and MIDI DIN output |
+| ALSA device name | `hw:UR22mkII` — do not use `hw:UR22C` or `hw:UR22CmkII` |
+| Microphone or direct input | Into UR22mkII input 1 |
+| MIDI cable | From UR22mkII MIDI OUT to synth or sound module |
+| USB drive (optional) | For WAV recording — auto-detected at startup |
+
+---
+
+## Quick start
+
+```bash
+# Build
+cd ~/Belltracker
+./setup.sh          # or: mkdir -p build && cd build && cmake .. && make
+
+# Run JACK
+jackd -d alsa -d hw:UR22mkII -r 48000 -p 256 -n 3 &
+
+# Run (normal calibration)
+./build/belltracker
+
+# Run (skip calibration, load previous session's bell data)
+./build/belltracker --load-cal
+
+# Help
+./build/belltracker --help
+```
+
+---
+
+## Architecture
+
+### State machines
+
+The entire application is built around three explicit state machines. No ad hoc flags or boolean mode variables.
+
+**`AppState`** — top-level mode:
+```
+CAL  →  PERF
+```
+Transitions via `finalize_cal()` (bell-1 repeat), the damped-strike bypass gesture, or `--load-cal` at startup. Once in PERF, never returns to CAL without a restart.
+
+**`CalSubState`** — cal phase sub-states:
+```
+AWAITING_STRIKE
+    │ onset detected
+    ▼
+CAPTURING  (500ms)
+    │ capture complete
+    ▼
+analyze_bell()
+    ├─ damped first strike  → BYPASS_LOADING (transient) → BYPASS_ACK_PENDING
+    │                                                           │ 1s deadline
+    │                                                           ▼
+    │                                              success: PERF  /  fail: AWAITING_STRIKE
+    │
+    ├─ normal registration  → BELL_CONFIRM_PENDING
+    │                              │ 1s deadline
+    │                              ▼
+    │                         AWAITING_STRIKE  (or finalize_cal if max bells)
+    │
+    └─ bell-1 repeat        → finalize_cal() → PERF
+```
+
+`BYPASS_LOADING` is transient — entered and exited synchronously within a single sample's handling. Both `BYPASS_ACK_PENDING` and `BELL_CONFIRM_PENDING` poll a stored JACK-time deadline each callback rather than sleeping a thread — keeps all shared state single-writer with no locking.
+
+**`MidiWorkerState`** — MIDI worker thread:
+```
+IDLE  →  HOLDING_NOTE  →  IDLE
+```
+The worker dequeues `MidiCmd` structs posted by the RT callback. `IDLE` sends bare note-on/off events immediately. `HOLDING_NOTE` sleeps out the hold time, then sends note-off and any trailing gap, then returns to `IDLE`.
+
+**`NoteState`** per bell — perf phase sounding state:
+```
+SILENT  →  SOUNDING  →  SILENT
+```
+
+### Mid-buffer state handoff
+
+If `AppState` flips from `CAL` to `PERF` mid-JACK-buffer (e.g., bell-1 repeat detected at sample 47 of a 256-sample callback), the remaining 209 samples in that same callback are immediately handed to `perf_process()`. No samples are processed under a stale state, and none are dropped.
+
+---
+
+## Calibration phase
+
+### Signal path
+
+1. **Pre-onset ring buffer** (100ms, `CAL_PRE_RING_SAMP` = 4800 samples) — always running, so the attack transient is captured even though onset is detected after it has begun.
+2. **Rolling RMS onset detection** (256-sample window, `ONSET_THRESHOLD` = 0.02) — also always running so it stays warm through captures and `BELL_CONFIRM_PENDING` periods.
+3. **500ms sustain capture** (`CAL_CAPTURE_MS`) into `BellData::cal_buf`.
+4. **`analyze_bell()`** — runs synchronously on the RT thread. Does not block on MIDI I/O (all MIDI is posted to the worker queue). Does block briefly on FFT and file I/O at cal-end — an accepted one-time exception masked by the cal-complete arpeggio.
+
+### Bypass gesture (bell 1 only)
+
+If the very first strike of a session decays in under `DAMPED_DECAY_MS` (40ms) — measured peak-to-release by `measure_decay_ms()` — the tracker interprets it as a cal-bypass command rather than a note registration. The technique is grasping the bell's brass casting while or just after striking, killing the ring almost immediately.
+
+On bypass detection:
+- `load_cal_from_file()` runs synchronously (same RT-thread exception as the FFT step).
+- On success: Goertzel filters re-initialized, `AppState` flips to `PERF`, recording starts.
+- State transitions to `BYPASS_ACK_PENDING`; the 1-second ack delay is a polled deadline, not a thread sleep.
+- On deadline: bypass ping posted, then cal-complete arpeggio (success) or triple-ping error + return to `AWAITING_STRIKE` (failure).
+
+### Instrument classification
+
+`measure_attack_ms()` finds the time from onset to peak RMS in the capture buffer.
+- Attack < `ATTACK_BELL_MS` (25ms) → `InstrumentType::BELL`
+- Attack ≥ 25ms → `InstrumentType::CHIME`
+
+### Pitch detection (YIN)
+
+4096-sample window, applied to the sustain portion of the capture:
+- **BELL**: window starts 30ms after onset (skips the mallet transient).
+- **CHIME**: window centred in the sustain region (cleanest fundamental).
+
+### NMF template building
+
+At `finalize_cal()`: a 32768-point radix-2 FFT (Hann-windowed, zero-padded) of each bell's full capture (pre-ring + sustain) builds a real spectral fingerprint per bell. Templates are normalized to unit L1 norm and stored in `BellData::nmf_template[n_bells]`. This is what makes simultaneous-onset separation possible in the perf phase — templates are derived from the actual acoustic character of each instrument in the room, not from ideal tuning tables.
+
+### Per-bell confirmation
+
+After each successful registration, `cal_state_` moves to `BELL_CONFIRM_PENDING`. When `confirm_deadline_s_` (now + `BELL_CONFIRM_DELAY_MS` = 1000ms) is reached, the bell's note plays `BELL_CONFIRM_REPEATS` (3) times at arpeggio timing. No new capture starts until the confirmation has finished playing.
+
+Wall-clock time per bell during calibration: ~1s delay + 3 × 0.5s playback = ~2.5 seconds minimum. For a 20-bell set, calibration takes roughly 50 seconds. This is a deliberate design tradeoff for keeping `cal_state_`/`bells_`/`n_bells_` single-writer with no locking.
+
+### Cal completion
+
+Triggered by:
+- Bell 1 struck a second time within `REPEAT_CENTS_TOL` (20 cents)
+- `n_bells_` reaching `MAX_BELLS` (20) — confirmation plays first, then finalize
+
+`finalize_cal()`:
+1. Builds NMF templates via FFT.
+2. Saves cal data to `belltracker_cal.dat` (detached write thread — does not block).
+3. Posts the cal-complete arpeggio to the MIDI worker.
+4. Starts WAV recording if a USB drive is present.
+5. Sets `AppState::PERF`.
+
+---
+
+## Performance phase
+
+### Goertzel filter bank
+
+One filter per registered bell, tuned to that bell's calibrated fundamental. Fed every sample. Every `GOERTZEL_WINDOW` (128 samples, ~2.7ms) the energy vector `V[n_bells]` is snapshotted and the filters reset.
+
+### Iterative NMF deconvolution
+
+`V ≈ T·H` is solved for the activation vector `H` via `NMF_ITERS` (4) Lee-Seung multiplicative-update iterations:
+
+```
+H[b] ← H[b] · (T^T V)[b] / (T^T T H)[b]
+```
+
+The template Gram matrix (`T^T·T`) is invariant after calibration, so it is built once lazily on the first perf window (`build_nmf_gram()`) rather than recomputed every 2.7ms.
+
+`H` is warm-started from `BellData::h_nmf` (previous window's converged value) since bells sustain across many windows — reduces iterations needed and keeps continuity between windows.
+
+**Why iterative NMF instead of a cosine projection:** the old single-step approach (`H[b] = dot(V, template_b) / (||template_b|| · total_energy)`) works for isolated strikes. For simultaneous onsets, two bells' real spectral templates share energy in overlapping Goertzel bins, inflating each bell's score by leakage from the other. Multiplicative-update NMF properly deconvolves overlapping templates, giving each bell its individual activation even in a chord.
+
+### Note-on / note-off
+
+- `H[b] / total_energy >= NMF_THRESHOLD` (0.25) while `NoteState::SILENT` → note-on, state → `SOUNDING`.
+- Sustain gate: while `SOUNDING`, any window above half-threshold (`NMF_THRESHOLD * 0.5`) resets the decay timer.
+- `NOTE_OFF_DECAY_S` (2.5s) since last above half-threshold → note-off, state → `SILENT`.
+
+---
+
+## MIDI output
+
+All MIDI sends go through an off-RT worker thread. The RT callback posts `MidiCmd` structs to a mutex/condvar queue — the push is brief (pointer copy + notify) and safe from within the JACK process callback.
+
+**Channel assignment:** `bell_channel(i) = i % SYSTEM_CHANNEL` = `i % 15`. Channels 0–14 carry bell notes; channel 15 (MIDI channel 16 in 1-indexed notation) is reserved for system status prompts and is never assigned to a bell.
+
+### Headless status prompts
+
+| Event | Channel | Note | Pattern | Meaning |
+|---|---|---|---|---|
+| Startup | 15 | 1 | Single ping, 150ms. Repeats every 5s (`READY_PING_INTERVAL_S`) until the first strike | Audio connected, armed — waiting for cal or bypass gesture |
+| Bell registered | Bell's channel | Bell's note | 1s delay, then 3× at arpeggio timing (400ms on / 100ms gap) | Bell confirmed |
+| Cal-complete / bypass success | Each bell's channel | Each bell's note | Sequential arpeggio, 0.5s onset-to-onset | Cal complete — entering PERF |
+| Bypass recognized | 15 | 2 | Single ping, 150ms, after 1s delay | Damped strike accepted, loading saved data |
+| Bypass failed | 15 | 3 | Three rapid pings, 80ms each | No saved cal data found — continuing CAL |
+
+The triple-ping error pattern is intentionally different in rhythm, not just pitch, so it reads as "error" without needing to identify notes.
+
+---
+
+## WAV recording
+
+During PERF, all audio from the UR22mkII is recorded to a WAV file on the first USB drive found under `/media/mark/` or `/media/pi/`. If no drive is present, recording is silently disabled.
+
+**Format:** mono, 48kHz, 16-bit PCM.
+
+**File naming:** `perf_001.wav`, `perf_002.wav`, etc. The highest existing number is scanned at startup; each session gets the next available number.
+
+**RT safety:** `record_push()` in the JACK callback converts float→int16 and writes into a lock-free SPSC ring buffer (262144 samples ≈ 5.5s). A dedicated write thread (`record_writer_run`) drains the ring every 2 seconds (`RECORD_FLUSH_SECS`) and fsyncs every 5 drain cycles (`RECORD_FSYNC_EVERY`).
+
+**Clean shutdown (UR22mkII unplugged):** JACK fires `jack_shutdown_cb` → destructor calls `stop_recording()` → write thread signals `record_stop_`, does a final ring drain, seeks to byte 0, patches the RIFF/data size fields with the actual sample count, fsyncs, closes. The WAV file is fully playable.
+
+**Hard power cut:** The 44-byte WAV header has zeroed size fields (written as a placeholder at file open). The audio data is intact to the most recent fsync (~10s). Recovery:
+```bash
+sox --ignore-length perf_001.wav perf_001_fixed.wav
+```
+
+---
+
+## Cal data persistence
+
+Saved automatically at the end of every successful `finalize_cal()`. Plain text format — editable by hand if a single bell's data needs correction without a full re-cal.
+
+```
+BELLTRACKER_CAL_V1
+n_bells=<N>
+[bell]
+idx=<i>
+freq_hz=<f>
+cents=<f>
+midi_note=<i>
+type=BELL|CHIME
+attack_ms=<f>
+template=<f>,<f>,...   (N comma-separated values, one per registered bell)
+[bell]
+...
+```
+
+Float values written with `setprecision(9)` — exact round-trip verified.
+
+Load failures (missing file, wrong format, wrong bell count, wrong template length) fall back to normal CAL rather than crashing or running with bad data.
+
+**CLI flags:**
+```bash
+./belltracker                       # normal CAL, saves on completion
+./belltracker --load-cal[=PATH]     # load PATH (default: belltracker_cal.dat), skip to PERF
+./belltracker --save-cal=PATH       # override save path
+./belltracker --help
+```
+
+---
+
+## FluidSynth integration (optional)
+
+belltracker is a pure MIDI source. FluidSynth runs as a second ALSA sequencer subscriber alongside the UR22mkII DIN out — ALSA seq ports support multiple simultaneous subscribers, so no source code changes are needed.
+
+Deploy files in `deploy/`:
+
+| File | Purpose |
+|---|---|
+| `fluidsynth.service` | Systemd user service — JACK audio out, ALSA seq MIDI in |
+| `connect-fluidsynth.service` | Oneshot — runs after both belltracker and FluidSynth are up |
+| `connect-belltracker-fluidsynth.sh` | `aconnect` routing script with retry loop |
+
+Update the soundfont path in `fluidsynth.service` before enabling.
+
+---
+
+## Autostart after boot
+
+All services run as **systemd user services** with linger enabled — the user session persists at boot without login, USB auto-mount still works under `/media/mark/`, audio group and RT permissions work as-is.
+
+```bash
+# One-time setup (run after testing the binary manually)
+bash deploy/install-services.sh
+```
+
+The script enables linger, installs service files to `~/.config/systemd/user/`, and enables the services. `belltracker.service` starts with `--load-cal` by default.
+
+**Service order:** `jackd` → `fluidsynth` → `belltracker` → `connect-fluidsynth` (oneshot)
+
+**Shutdown:** unplugging the UR22mkII fires `jack_shutdown_cb`, which cleanly finalizes the WAV recording and exits 0. `Restart=on-failure` means a crash auto-restarts; a clean UR22 unplug does not.
+
+**Logs:**
+```bash
+journalctl --user -u belltracker -f
+journalctl --user -u jackd -f
+```
+
+---
+
+## File layout
+
+```
+~/Belltracker/
+├── belltracker.h           # shared types, enums, constants, class declaration
+├── belltracker_cal.cpp     # cal phase, MIDI worker, init, persistence, helpers
+├── belltracker_perf.cpp    # perf phase: Goertzel, NMF, note-on/off
+├── belltracker_record.cpp  # WAV recording: USB detection, SPSC ring, write thread
+├── main.cpp                # JACK client entry point, signal handling, shutdown
+├── CMakeLists.txt
+├── setup.sh
+├── belltracker_cal.dat     # saved cal data (written after first cal session)
+├── build/
+│   └── belltracker         # compiled binary
+├── deploy/
+│   ├── install-services.sh         # one-shot autostart setup
+│   ├── install-tools.sh            # recommended tools installer
+│   ├── jackd.service
+│   ├── belltracker.service
+│   ├── fluidsynth.service
+│   ├── connect-fluidsynth.service
+│   └── connect-belltracker-fluidsynth.sh
+├── README.md
+└── GUIDE.md
+```
+
+---
+
+## Constants reference
+
+All in `belltracker.h`. Rebuild after any change.
+
+| Constant | Default | Description |
+|---|---|---|
+| `MAX_BELLS` | 20 | Maximum bells per session |
+| `REPEAT_CENTS_TOL` | 20.0 | ±cents tolerance for bell-1 repeat detection |
+| `ONSET_THRESHOLD` | 0.02 | RMS onset threshold |
+| `NMF_THRESHOLD` | 0.25 | Activation threshold for note-on |
+| `NOTE_OFF_DECAY_S` | 2.5 | Seconds below half-threshold before auto note-off |
+| `GOERTZEL_WINDOW` | 128 | Samples per NMF window (~2.7ms at 48kHz) |
+| `CAL_PRE_RING_MS` | 100 | Pre-onset ring buffer duration |
+| `CAL_CAPTURE_MS` | 500 | Post-onset sustain capture duration |
+| `ATTACK_BELL_MS` | 25.0 | Bell/chime classifier boundary (ms) |
+| `TEMPLATE_FFT_SIZE` | 32768 | FFT size for NMF template building |
+| `NMF_ITERS` | 4 | Lee-Seung multiplicative-update iterations per window |
+| `ARPEGGIO_NOTE_MS` | 400 | Note duration in cal-complete arpeggio and bell confirm |
+| `ARPEGGIO_GAP_MS` | 100 | Gap after each arpeggio note (0.5s total onset-to-onset) |
+| `BELL_CONFIRM_DELAY_MS` | 1000 | Delay between registration and confirmation playback |
+| `BELL_CONFIRM_REPEATS` | 3 | Times a newly registered bell's note plays as confirmation |
+| `READY_PING_INTERVAL_S` | 5.0 | Repeat interval for the waiting ping before first strike |
+| `DECAY_RELEASE_FRAC` | 0.15 | Fraction of peak RMS counted as released (bypass detection) |
+| `DAMPED_DECAY_MS` | 40.0 | Max peak-to-release time for a damped/grasped strike |
+| `BYPASS_ACK_DELAY_MS` | 1000 | Delay between bypass detection and audible ack |
+| `SYSTEM_CHANNEL` | 15 | Reserved MIDI channel for status prompts (0-indexed) |
+| `CAL_FILE_DEFAULT` | `belltracker_cal.dat` | Default cal data save/load path |
+| `RECORD_RING_SAMPS` | 262144 | SPSC ring buffer size (~5.5s at 48kHz) |
+| `RECORD_FLUSH_SECS` | 2 | Disk write interval (seconds) |
+| `RECORD_FSYNC_EVERY` | 5 | fsync every N write cycles (~10s) |
+
+Constants that need empirical tuning against real instruments: `ONSET_THRESHOLD`, `NMF_THRESHOLD`, `ATTACK_BELL_MS`, `DECAY_RELEASE_FRAC`, `DAMPED_DECAY_MS`. Starting values are reasonable but were not derived from physical measurement.

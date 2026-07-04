@@ -1,0 +1,14 @@
+# ~/.config/systemd/user/connect-fluidsynth.service
+# Matches the version captured in the chat record (user-service form).
+[Unit]
+Description=Connect belltracker MIDI out to FluidSynth in (ALSA seq)
+After=belltracker.service fluidsynth.service
+Requires=belltracker.service fluidsynth.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/mark/Belltracker/deploy/connect-belltracker-fluidsynth.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target

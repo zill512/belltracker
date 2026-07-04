@@ -1,0 +1,15 @@
+# ~/.config/systemd/user/jackd.service
+# RECONSTRUCTED 2026-07-02 from project record — diff against chat-3 original if available.
+[Unit]
+Description=JACK audio server (UR22mkII, 48kHz/256/3)
+After=sound.target
+
+[Service]
+ExecStart=/usr/bin/jackd -d alsa -d hw:UR22mkII -r 48000 -p 256 -n 3
+Restart=on-failure
+RestartSec=2
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=default.target

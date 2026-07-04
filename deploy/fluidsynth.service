@@ -1,0 +1,15 @@
+# ~/.config/systemd/user/fluidsynth.service
+# RECONSTRUCTED 2026-07-02 from project record — diff against chat-3 original if available.
+# Audio out via JACK; MIDI in via ALSA sequencer (routed by connect-fluidsynth).
+[Unit]
+Description=FluidSynth software synth (JACK audio, ALSA seq MIDI in)
+After=jackd.service
+Requires=jackd.service
+
+[Service]
+ExecStart=/usr/bin/fluidsynth -is -a jack -j -m alsa_seq -g 1 /usr/share/sounds/sf2/FluidR3_GM.sf2
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

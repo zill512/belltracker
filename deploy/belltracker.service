@@ -1,0 +1,15 @@
+# ~/.config/systemd/user/belltracker.service
+# RECONSTRUCTED 2026-07-02 from project record — diff against chat-3 original if available.
+[Unit]
+Description=belltracker handbell MIDI tracker
+After=jackd.service
+Requires=jackd.service
+
+[Service]
+WorkingDirectory=/home/mark/Belltracker
+ExecStart=/home/mark/Belltracker/build/belltracker
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
