@@ -1,6 +1,8 @@
 // belltracker_cal.cpp — cal phase, auto bell/chime detection, YIN, NMF templates
 #include "belltracker.h"
 #include <cstring>
+#include <cctype>
+#include <cstdlib>
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
@@ -825,6 +827,37 @@ void BellTracker::midi_note_off(int note, int channel) {
 //   [bell]
 //   ...
 
+// ── note-name helpers ─────────────────────────────────────────────────────────
+// Scientific pitch notation: MIDI 60 = C4 (middle C), octave = midi/12 - 1.
+// This matches the label cast on a physical handbell: the bell stamped "C5"
+// sounds ~523 Hz = MIDI 72 = "C5" here. (Handbell *written* notation is a
+// transposing convention — written C4 sounds C5 — but belltracker deals in
+// sounding pitch, so SPN keeps names aligned with the castings.)
+static const char* NOTE_NAMES[12] =
+    { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+
+static void midi_to_name(int midi, char* out, size_t n) {
+    if (midi < 0 || midi > 127) { snprintf(out, n, "?"); return; }
+    snprintf(out, n, "%s%d", NOTE_NAMES[midi % 12], midi / 12 - 1);
+}
+
+// Accepts C4, c#5, Db3, F#-1, etc. Returns MIDI 0-127, or -1 on parse failure.
+static int name_to_midi(const char* name) {
+    if (!name || !name[0]) return -1;
+    int i = 0;
+    char letter = toupper((unsigned char)name[i++]);
+    static const int BASE[7] = { 9, 11, 0, 2, 4, 5, 7 };  // A B C D E F G
+    if (letter < 'A' || letter > 'G') return -1;
+    int semi = BASE[letter - 'A'];
+    if (name[i] == '#')      { semi += 1; ++i; }
+    else if (name[i] == 'b') { semi -= 1; ++i; }
+    char* end = nullptr;
+    long octave = strtol(name + i, &end, 10);
+    if (end == name + i || *end != '\0') return -1;
+    long midi = (octave + 1) * 12 + semi;
+    return (midi >= 0 && midi <= 127) ? (int)midi : -1;
+}
+
 void BellTracker::save_cal_to_file(const std::string& path,
                                     const std::vector<BellData>& snapshot,
                                     int n_bells_snapshot) {
@@ -843,6 +876,8 @@ void BellTracker::save_cal_to_file(const std::string& path,
         f << "freq_hz="   << b.freq_hz                                           << "\n";
         f << "cents="     << b.cents                                             << "\n";
         f << "midi_note=" << b.midi_note                                         << "\n";
+        char nn[8]; midi_to_name(b.midi_note, nn, sizeof(nn));
+        f << "note_name=" << nn                                                  << "\n";
         f << "type="      << (b.type == InstrumentType::BELL ? "BELL" : "CHIME") << "\n";
         f << "attack_ms=" << b.attack_ms                                         << "\n";
         f << "template=";
@@ -889,6 +924,7 @@ bool BellTracker::load_cal_from_file(const std::string& path) {
             BellData b;
             int  idx = -1;
             char type_str[16] = {};
+            char name_str[8]  = {};
 
             while (i < lines.size() && lines[i] != "[bell]") {
                 const std::string& l = lines[i];
@@ -896,6 +932,7 @@ bool BellTracker::load_cal_from_file(const std::string& path) {
                 else if (sscanf(l.c_str(), "freq_hz=%f",   &b.freq_hz)  == 1) { ++i; continue; }
                 else if (sscanf(l.c_str(), "cents=%f",     &b.cents)    == 1) { ++i; continue; }
                 else if (sscanf(l.c_str(), "midi_note=%d", &b.midi_note)== 1) { ++i; continue; }
+                else if (sscanf(l.c_str(), "note_name=%7s", name_str)    == 1) { ++i; continue; }
                 else if (sscanf(l.c_str(), "attack_ms=%f", &b.attack_ms)== 1) { ++i; continue; }
                 else if (sscanf(l.c_str(), "type=%15s",    type_str)    == 1) {
                     b.type = (strcmp(type_str, "BELL") == 0) ? InstrumentType::BELL
@@ -915,6 +952,20 @@ bool BellTracker::load_cal_from_file(const std::string& path) {
                 fprintf(stderr, "belltracker: malformed bell entry in %s, aborting load\n",
                         path.c_str());
                 return false;
+            }
+
+            // midi_note absent or 0 in the file — fall back to note_name
+            if (b.midi_note <= 0) {
+                int from_name = name_to_midi(name_str);
+                if (from_name < 0) {
+                    fprintf(stderr, "belltracker: bell %d in %s has no usable "
+                            "midi_note or note_name ('%s'), aborting load\n",
+                            idx, path.c_str(), name_str);
+                    return false;
+                }
+                b.midi_note = from_name;
+                printf("belltracker: bell %d midi_note from note_name %s -> %d\n",
+                       idx, name_str, from_name);
             }
             loaded.push_back(std::move(b));
         }
