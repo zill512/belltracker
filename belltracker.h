@@ -53,6 +53,12 @@ static constexpr int    CAL_CAPTURE_MS      = 500;
 static constexpr int    CAL_PRE_RING_SAMP   = SAMPLE_RATE * CAL_PRE_RING_MS  / 1000; // 4800
 static constexpr int    CAL_CAPTURE_SAMP    = SAMPLE_RATE * CAL_CAPTURE_MS   / 1000; // 24000
 
+// Pitch analysis: skip this much audio after onset before the YIN window —
+// the strike transient (clapper impact, broadband hash, inharmonic partials
+// settling) corrupts fundamental estimation; by 250 ms the hum/prime tones
+// dominate. 500 ms sustain capture leaves 250 ms >> YIN's 4096-sample window.
+static constexpr float  PITCH_SKIP_MS       = 250.0f;
+
 // Attack classifier threshold
 static constexpr float  ATTACK_BELL_MS      = 25.0f;
 

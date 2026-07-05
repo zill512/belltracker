@@ -514,16 +514,17 @@ void BellTracker::analyze_bell(BellData& b) {
     const float* yin_ptr;
     int          yin_len;
 
-    if (b.type == InstrumentType::BELL) {
-        int pre = (int)b.cal_buf.size() - CAL_CAPTURE_SAMP;
-        int skip = std::max(0, std::min(pre + (int)(0.030f * SAMPLE_RATE),
-                                        len - YIN_WIN));
+    {
+        // Skip pre-onset ring + strike transient (PITCH_SKIP_MS) for bells
+        // and chimes alike; clamp so at least YIN_WIN samples remain.
+        int pre  = (int)b.cal_buf.size() - CAL_CAPTURE_SAMP;
+        int skip = std::max(0, std::min(
+            pre + (int)(PITCH_SKIP_MS * 0.001f * SAMPLE_RATE),
+            len - YIN_WIN));
         yin_ptr = b.cal_buf.data() + skip;
         yin_len = std::min(YIN_WIN, len - skip);
-    } else {
-        int start = std::max(0, len / 2 - YIN_WIN / 2);
-        yin_ptr = b.cal_buf.data() + start;
-        yin_len = std::min(YIN_WIN, len - start);
+        DBG("YIN window: skip %d samples (%.0f ms after onset), analyze %d\n",
+            skip, (skip - pre) * 1000.0f / SAMPLE_RATE, yin_len);
     }
 
     float freq = yin_fundamental(yin_ptr, yin_len, SAMPLE_RATE);
