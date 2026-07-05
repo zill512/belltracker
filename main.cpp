@@ -42,6 +42,7 @@ static void jack_shutdown_cb(void*) {
 int main(int argc, char** argv) {
     std::string load_cal_path;
     std::string save_cal_path = CAL_FILE_DEFAULT;
+    int         channel_override = -1;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -51,6 +52,12 @@ int main(int argc, char** argv) {
                                                         : CAL_FILE_DEFAULT;
         } else if (arg.rfind("--save-cal=", 0) == 0) {
             save_cal_path = arg.substr(std::string("--save-cal=").size());
+        } else if (arg.rfind("--channel=", 0) == 0) {
+            channel_override = atoi(arg.c_str() + 10);
+            if (channel_override < 0 || channel_override > 14) {
+                fprintf(stderr, "--channel must be 0-14 (15 is reserved)\n");
+                return 1;
+            }
         } else if (arg == "--debug" || arg == "-d") {
             g_debug = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -60,6 +67,8 @@ int main(int argc, char** argv) {
                    CAL_FILE_DEFAULT);
             printf("  --save-cal=PATH    Path CAL data is saved to on completion\n");
             printf("                     (default: %s)\n", CAL_FILE_DEFAULT);
+            printf("  --channel=N        Send all bells on MIDI channel N (0-14), overriding\n");
+            printf("                     per-bell channels stored in the cal file.\n");
             printf("  --debug, -d        Verbose diagnostics: state transitions, waiting\n");
             printf("                     heartbeat w/ RMS, strike analysis, NMF activations.\n");
             printf("                     Bench use only — may cost occasional xruns.\n");
@@ -111,7 +120,7 @@ int main(int argc, char** argv) {
     jack_set_process_callback(g_client, jack_process_cb, g_tracker);
     jack_on_shutdown(g_client, jack_shutdown_cb, nullptr);
 
-    if (!g_tracker->init(load_cal_path, save_cal_path)) {
+    if (!g_tracker->init(load_cal_path, save_cal_path, channel_override)) {
         delete g_tracker; jack_client_close(g_client);
         return 1;
     }

@@ -83,6 +83,12 @@ static constexpr int    BELL_CONFIRM_REPEATS  = 3;
 // is detected (see heard_first_input_ in cal_process()).
 static constexpr double READY_PING_INTERVAL_S = 5.0;
 
+// MIDI output channels/voice — all bells default to a single channel; the cal
+// file stores each bell's channel (editable), and --channel=N overrides both.
+// Channel 15 stays reserved for system prompts.
+static constexpr int    DEFAULT_BELL_CHANNEL      = 0;
+static constexpr int    GM_PROGRAM_GLOCKENSPIEL   = 9;   // GM patch 10 (0-indexed)
+
 // NMF deconvolution (perf phase)
 static constexpr int    NMF_ITERS           = 4;      // multiplicative-update iterations per window
 static constexpr float  NMF_EPS             = 1e-9f;  // denominator floor
@@ -168,6 +174,7 @@ struct BellData {
     NoteState      note_state      = NoteState::SILENT;
     double         last_onset_time = 0.0;
     float          h_nmf           = 1.0f;  // warm-start activation for iterative NMF
+    int            channel         = DEFAULT_BELL_CHANNEL;  // MIDI out channel (from cal file / --channel)
 };
 
 // ── MIDI worker command ──────────────────────────────────────────────────────
@@ -183,6 +190,9 @@ struct MidiCmd {
                          // command runs — lets back-to-back post_ping() calls
                          // form an evenly-spaced arpeggio instead of a
                          // back-to-back run with no gap between notes
+    int  program = -1;  // >=0: program-change event on `channel`
+                         // (note/velocity/duration/gap ignored). Deliberately
+                         // LAST so existing positional 4/5-arg inits are unaffected.
 };
 
 // ── MIDI worker state machine ─────────────────────────────────────────────────
@@ -216,7 +226,8 @@ public:
     ~BellTracker();
 
     bool init(const std::string& load_cal_path = "",
-              const std::string& save_cal_path = CAL_FILE_DEFAULT);
+              const std::string& save_cal_path = CAL_FILE_DEFAULT,
+              int channel_override = -1);
     void process(const float* in, jack_nframes_t nframes);
     void notify_ready();    // audible "armed" cue after audio connects
     void stop_recording();  // flush + close WAV; safe to call from shutdown handlers
@@ -334,6 +345,9 @@ private:
     void    midi_worker_run();
     void    post_midi(MidiCmd cmd);          // safe from RT and non-RT
     void    post_ping(int note, int ch, int vel, int dur_ms, int gap_ms = 0); // note-on+hold+off(+gap)
+    void    post_pc(int channel, int program);   // queue a program change
+    void    send_program_changes();              // PC (glockenspiel) on all bell channels
+    int     channel_override_ = -1;              // --channel=N; -1 = use cal file / default
 
     // ── internal helpers ──
     void    cal_process(const float* in, jack_nframes_t nframes);
@@ -350,8 +364,9 @@ private:
     void    finalize_cal();
     void    midi_note_on(int note, int channel, int vel = 100);
     void    midi_note_off(int note, int channel);
+    void    midi_program_change(int channel, int program);
     void    post_system_prompt(SystemPrompt p);
-    static int bell_channel(int bell_idx) { return bell_idx % SYSTEM_CHANNEL; }
+    int     bell_channel(int i) const { return bells_[i].channel; }
     bool    open_midi();
     void    find_ur22_port();
 };

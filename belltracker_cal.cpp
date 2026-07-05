@@ -89,6 +89,11 @@ void BellTracker::midi_worker_run() {
 
             if (cmd.note < 0) return;  // poison pill
 
+            if (cmd.program >= 0) {    // program change — no note handling
+                midi_program_change(cmd.channel, cmd.program);
+                break;
+            }
+
             if (cmd.duration_ms > 0) {
                 midi_note_on(cmd.note, cmd.channel, cmd.velocity);
                 holding = cmd;
@@ -161,15 +166,21 @@ void BellTracker::post_system_prompt(SystemPrompt p) {
 
 // ── init ─────────────────────────────────────────────────────────────────────
 bool BellTracker::init(const std::string& load_cal_path,
-                        const std::string& save_cal_path) {
+                        const std::string& save_cal_path,
+                        int channel_override) {
     if (!open_midi()) return false;
+    channel_override_ = channel_override;
     save_cal_path_ = save_cal_path;
     find_usb_drive();
 
     if (!load_cal_path.empty()) {
         if (load_cal_from_file(load_cal_path)) {
-            for (int i = 0; i < n_bells_; ++i)
+            for (int i = 0; i < n_bells_; ++i) {
                 bells_[i].goertzel.init(bells_[i].freq_hz, GOERTZEL_WINDOW);
+                if (channel_override_ >= 0)          // --channel beats cal file
+                    bells_[i].channel = channel_override_;
+            }
+            send_program_changes();
             state_ = AppState::PERF;
             printf("belltracker: MIDI ready → UR22mkII DIN out\n");
             printf("belltracker: loaded %d bell(s) from %s\n",
@@ -196,6 +207,7 @@ bool BellTracker::init(const std::string& load_cal_path,
                 load_cal_path.c_str());
     }
 
+    send_program_changes();
     printf("belltracker: MIDI ready → UR22mkII DIN out\n");
     printf("belltracker: CAL mode\n");
     printf("  Pre-onset ring : %d ms\n", CAL_PRE_RING_MS);
@@ -372,6 +384,8 @@ void BellTracker::start_capture() {
             b.cal_buf.push_back(pre_ring_[i]);
     }
 
+    if (channel_override_ >= 0)
+        b.channel = channel_override_;
     bells_.push_back(std::move(b));
 }
 
@@ -684,6 +698,7 @@ void BellTracker::finalize_cal() {
     build_nmf_templates();   // compute-only, no blocking
 
     int nb = 0, nc = 0;
+    send_program_changes();
     for (int i = 0; i < n_bells_; ++i) {
         bells_[i].goertzel.init(bells_[i].freq_hz, GOERTZEL_WINDOW);
         const char* ts = (bells_[i].type == InstrumentType::BELL) ? "bell" : "chime";
@@ -810,6 +825,40 @@ void BellTracker::midi_note_off(int note, int channel) {
     snd_seq_event_output_direct(seq_, &ev);
 }
 
+void BellTracker::midi_program_change(int channel, int program) {
+    if (!seq_) return;
+    snd_seq_event_t ev;
+    snd_seq_ev_clear(&ev);
+    snd_seq_ev_set_source(&ev, seq_port_);
+    snd_seq_ev_set_subs(&ev);
+    snd_seq_ev_set_direct(&ev);
+    snd_seq_ev_set_pgmchange(&ev, channel & 0xF, program & 0x7F);
+    snd_seq_event_output(seq_, &ev);
+    snd_seq_drain_output(seq_);
+    printf("belltracker: program change ch %d -> %d\n", channel, program);
+}
+
+void BellTracker::post_pc(int channel, int program) {
+    post_midi({ 0, channel, 0, 0, 0, program });
+}
+
+// Send the voice (glockenspiel) to every channel bells will play on. Called
+// after MIDI opens (covers cal confirmation pings on the default channel) and
+// again after cal load/finalize (per-bell channels may differ via cal file).
+void BellTracker::send_program_changes() {
+    bool sent[16] = {};
+    int def = (channel_override_ >= 0) ? channel_override_ : DEFAULT_BELL_CHANNEL;
+    post_pc(def, GM_PROGRAM_GLOCKENSPIEL);
+    sent[def & 0xF] = true;
+    for (int i = 0; i < n_bells_; ++i) {
+        int ch = bells_[i].channel & 0xF;
+        if (!sent[ch] && ch != SYSTEM_CHANNEL) {
+            post_pc(ch, GM_PROGRAM_GLOCKENSPIEL);
+            sent[ch] = true;
+        }
+    }
+}
+
 // ── cal data persistence ──────────────────────────────────────────────────────
 //
 // Plain-text format, one bell per [bell] block. Text rather than binary so
@@ -882,6 +931,7 @@ void BellTracker::save_cal_to_file(const std::string& path,
         f << "midi_note=" << b.midi_note                                         << "\n";
         char nn[8]; midi_to_name(b.midi_note, nn, sizeof(nn));
         f << "note_name=" << nn                                                  << "\n";
+        f << "channel="   << b.channel                                           << "\n";
         f << "type="      << (b.type == InstrumentType::BELL ? "BELL" : "CHIME") << "\n";
         f << "attack_ms=" << b.attack_ms                                         << "\n";
         f << "template=";
@@ -937,6 +987,7 @@ bool BellTracker::load_cal_from_file(const std::string& path) {
                 else if (sscanf(l.c_str(), "cents=%f",     &b.cents)    == 1) { ++i; continue; }
                 else if (sscanf(l.c_str(), "midi_note=%d", &b.midi_note)== 1) { ++i; continue; }
                 else if (sscanf(l.c_str(), "note_name=%7s", name_str)    == 1) { ++i; continue; }
+                else if (sscanf(l.c_str(), "channel=%d",   &b.channel)   == 1) { ++i; continue; }
                 else if (sscanf(l.c_str(), "attack_ms=%f", &b.attack_ms)== 1) { ++i; continue; }
                 else if (sscanf(l.c_str(), "type=%15s",    type_str)    == 1) {
                     b.type = (strcmp(type_str, "BELL") == 0) ? InstrumentType::BELL
@@ -956,6 +1007,13 @@ bool BellTracker::load_cal_from_file(const std::string& path) {
                 fprintf(stderr, "belltracker: malformed bell entry in %s, aborting load\n",
                         path.c_str());
                 return false;
+            }
+
+            if (b.channel < 0 || b.channel >= SYSTEM_CHANNEL) {
+                fprintf(stderr, "belltracker: bell %d channel %d invalid "
+                        "(0-%d), using %d\n", idx, b.channel,
+                        SYSTEM_CHANNEL - 1, DEFAULT_BELL_CHANNEL);
+                b.channel = DEFAULT_BELL_CHANNEL;
             }
 
             // midi_note absent or 0 in the file — fall back to note_name
