@@ -20,7 +20,7 @@ back through whatever synth is connected.
 | Microphone or direct input | Into UR22mkII input 1 |
 | Standard MIDI cable | From UR22mkII MIDI OUT to your synth or sound module |
 | Power supply for the Pi | USB-C |
-| USB drive (optional) | For recording — plug into Pi USB port before powering on |
+| USB drive (optional) | For recording — a real USB stick/drive, plugged in before powering on (the Pi's SD card is never used for recording) |
 
 ---
 
@@ -110,6 +110,12 @@ the performance.
 
 To get the files off the drive: unplug the USB drive after stopping the system (see
 below) and plug it into a computer.
+
+Only actual USB drives are used — an SD card sitting in the Pi's card slot is
+ignored, so recordings can never land on the system's own storage.
+
+All sounds — status pings, calibration confirmations, and performance notes —
+play through the synth in a glockenspiel voice, set automatically at startup.
 
 ---
 
@@ -233,6 +239,7 @@ STOP:
 | Bypass ack delay | ~1 second | Between grasp gesture and hearing response |
 | Recording format | Mono WAV, 48 kHz, 16-bit | |
 | Recording files | perf_001.wav, perf_002.wav… | New file each session |
+| Synth voice | Glockenspiel | Set automatically on the synth at startup |
 
 To adjust any of these, an engineer can edit the constants in `belltracker.h` and
 rebuild. See README.md for the full technical reference.

@@ -12,7 +12,7 @@ See **GUIDE.md** for operator instructions (no technical background required).
 
 | Item | Notes |
 |---|---|
-| Raspberry Pi 4 or 5 | Pi 5 users: update `-march`/`-mtune` flags in CMakeLists.txt (`cortex-a76`) |
+| Raspberry Pi 5 (or 4) | CMakeLists targets `-mcpu=cortex-a76` (Pi 5); Pi 4 users change to `cortex-a72` |
 | Steinberg UR22mkII | USB audio interface; provides audio input and MIDI DIN output |
 | ALSA device name | `hw:UR22mkII` — do not use `hw:UR22C` or `hw:UR22CmkII` |
 | Microphone or direct input | Into UR22mkII input 1 |
@@ -123,9 +123,13 @@ On bypass detection:
 
 ### Pitch detection (YIN)
 
-4096-sample window, applied to the sustain portion of the capture:
-- **BELL**: window starts 30ms after onset (skips the mallet transient).
-- **CHIME**: window centred in the sustain region (cleanest fundamental).
+4096-sample window, starting **250ms after onset** for bells and chimes alike
+(`PITCH_SKIP_MS`). The strike transient — clapper impact, broadband hash,
+inharmonic partials settling — corrupts fundamental estimation; by 250ms the
+hum/prime tones dominate. The 500ms sustain capture leaves 12000 samples after
+the skip, ~3× the YIN window. A strike damped shorter than ~250ms will analyze
+mostly room noise and fail the 60–8000Hz range check → re-strike (CAL wants
+free, ringing strikes anyway).
 
 ### NMF template building
 
@@ -184,7 +188,17 @@ The template Gram matrix (`T^T·T`) is invariant after calibration, so it is bui
 
 All MIDI sends go through an off-RT worker thread. The RT callback posts `MidiCmd` structs to a mutex/condvar queue — the push is brief (pointer copy + notify) and safe from within the JACK process callback.
 
-**Channel assignment:** `bell_channel(i) = i % SYSTEM_CHANNEL` = `i % 15`. Channels 0–14 carry bell notes; channel 15 (MIDI channel 16 in 1-indexed notation) is reserved for system status prompts and is never assigned to a bell.
+**Channel assignment:** all bells default to a single channel, 0
+(`DEFAULT_BELL_CHANNEL`). Each bell's channel is stored per-bell in the cal
+file (`channel=` — hand-editable for per-bell routing), and `--channel=N`
+overrides everything, file included. Valid range 0–14; channel 15 (MIDI
+channel 16, 1-indexed) is reserved for system status prompts and is rejected
+by the loader.
+
+**Voice:** a Program Change → Glockenspiel (GM program 9,
+`GM_PROGRAM_GLOCKENSPIEL`) is sent on every bell channel at CAL start, after
+`--load-cal`, and at cal completion. The PC reaches all ALSA seq subscribers —
+FluidSynth *and* the DIN out — so external synths switch patch too.
 
 ### Headless status prompts
 
@@ -202,7 +216,7 @@ The triple-ping error pattern is intentionally different in rhythm, not just pit
 
 ## WAV recording
 
-During PERF, all audio from the UR22mkII is recorded to a WAV file on the first USB drive found under `/media/mark/` or `/media/pi/`. If no drive is present, recording is silently disabled.
+During PERF, all audio from the UR22mkII is recorded to a WAV file on the first USB drive found under `/media/mark/` or `/media/pi/`. Candidates are validated against `/proc/mounts` — only mounts backed by USB mass storage (`/dev/sd*`) qualify. SD-card partitions (an SD left in the slot auto-mounts `bootfs`/`rootfs` under `/media/` too), NVMe partitions, and plain directories are skipped with a log line. If no qualifying drive is present, recording is disabled.
 
 **Format:** mono, 48kHz, 16-bit PCM.
 
@@ -231,6 +245,8 @@ idx=<i>
 freq_hz=<f>
 cents=<f>
 midi_note=<i>
+note_name=<C4|F#5|...>   (scientific pitch, MIDI 60 = C4; matches bell castings)
+channel=<0-14>           (MIDI out channel for this bell; default 0)
 type=BELL|CHIME
 attack_ms=<f>
 template=<f>,<f>,...   (N comma-separated values, one per registered bell)
@@ -240,6 +256,12 @@ template=<f>,<f>,...   (N comma-separated values, one per registered bell)
 
 Float values written with `setprecision(9)` — exact round-trip verified.
 
+**Load fallbacks:** `midi_note` missing or 0 → derived from `note_name`
+(accepts sharps, flats, lowercase: `C#5`, `Db4`, `c5`); both unusable →
+load aborts to normal CAL. `channel` missing → 0; out of range → warn + 0.
+Editing note_name/midi_note changes what MIDI note *plays*, not what's
+*detected* — detection follows `freq_hz` and the template.
+
 Load failures (missing file, wrong format, wrong bell count, wrong template length) fall back to normal CAL rather than crashing or running with bad data.
 
 **CLI flags:**
@@ -247,6 +269,8 @@ Load failures (missing file, wrong format, wrong bell count, wrong template leng
 ./belltracker                       # normal CAL, saves on completion
 ./belltracker --load-cal[=PATH]     # load PATH (default: belltracker_cal.dat), skip to PERF
 ./belltracker --save-cal=PATH       # override save path
+./belltracker --channel=N           # all bells on MIDI channel N (0-14), beats cal file
+./belltracker --debug               # verbose diagnostics (see Debug instrumentation)
 ./belltracker --help
 ```
 
@@ -265,6 +289,27 @@ Deploy files in `deploy/`:
 | `connect-belltracker-fluidsynth.sh` | `aconnect` routing script with retry loop |
 
 Update the soundfont path in `fluidsynth.service` before enabling.
+
+---
+
+## Debug instrumentation
+
+`--debug` (or `-d`) enables `[dbg]` diagnostics, off by default:
+
+- **Cal state tracing** — every `CalSubState` transition, by name.
+- **Waiting heartbeat** — every 2s in AWAITING_STRIKE: live RMS vs. onset
+  threshold (`[dbg] waiting  rms=0.0007  thr=0.0200  bells=3  armed=1`) —
+  the number to watch when setting UR22mkII input gain.
+- **Per-strike analysis** — first-strike decay vs. the damped-bypass
+  threshold, YIN result (freq/cents/attack/type), YIN window placement,
+  repeat-check distance when armed.
+- **Perf NMF dump** — 1/s: total Goertzel energy + top-3 normalized
+  activations vs. `NMF_THRESHOLD`.
+
+Several sites fire from the JACK RT callback (rare events or throttled ≤1Hz;
+stdout is line-buffered), but printf from the RT thread can still cost an
+occasional xrun — **bench use, not performances**. `~/btd.sh` runs services +
+foreground debug in one step.
 
 ---
 
