@@ -44,7 +44,11 @@ static constexpr float  REPEAT_CENTS_TOL    = 20.0f;
 static constexpr float  ONSET_THRESHOLD     = 0.02f;
 static constexpr float  NMF_THRESHOLD       = 0.25f;
 static constexpr float  NOTE_OFF_DECAY_S    = 2.5f;
-static constexpr int    GOERTZEL_WINDOW     = 128;
+// 1024 samples = 21.3ms = ~47Hz analysis bandwidth. 128 was too wide (375Hz):
+// adjacent bells' Goertzel bins became near-collinear and NMF couldn't separate
+// them — closely spaced sets produced sub-threshold activations (silence).
+// Simulation: 1024 + 15 NMF iters cleanly separates 12 chromatic bells from C4.
+static constexpr int    GOERTZEL_WINDOW     = 1024;
 static constexpr int    SAMPLE_RATE         = 48000;
 
 // Cal capture timing
@@ -93,10 +97,15 @@ static constexpr double READY_PING_INTERVAL_S = 5.0;
 // file stores each bell's channel (editable), and --channel=N overrides both.
 // Channel 15 stays reserved for system prompts.
 static constexpr int    DEFAULT_BELL_CHANNEL      = 0;
+// TEMPORARY: force every outgoing MIDI event (bells, prompts, program changes)
+// onto one channel at the output layer (midi_note_on/off/pgmchange). Per-bell
+// channels, the cal-file field, and --channel all keep working upstream and
+// take effect again the moment this is set to -1 (disabled).
+static constexpr int    FORCE_MIDI_CHANNEL        = 0;   // MIDI channel 1; -1 = off
 static constexpr int    GM_PROGRAM_GLOCKENSPIEL   = 9;   // GM patch 10 (0-indexed)
 
 // NMF deconvolution (perf phase)
-static constexpr int    NMF_ITERS           = 4;      // multiplicative-update iterations per window
+static constexpr int    NMF_ITERS           = 15;     // multiplicative-update iterations per window (15 needed to separate semitone-adjacent bells)
 static constexpr float  NMF_EPS             = 1e-9f;  // denominator floor
 
 // Cal data persistence — skip cal phase on subsequent runs
@@ -137,12 +146,13 @@ static constexpr int    BYPASS_ACK_DELAY_MS = 1000;
 // fixed note, distinguishable by ear from bell confirmation pings (different
 // channel) and from each other (note number / repetition pattern).
 static constexpr int    SYSTEM_CHANNEL           = 15;  // reserved, never used for bells
-static constexpr int    PROMPT_NOTE_READY        = 1;   // single ping: audio connected, armed
-static constexpr int    PROMPT_NOTE_BYPASS       = 2;   // single ping: damped strike recognized
-static constexpr int    PROMPT_NOTE_BYPASS_FAIL  = 3;   // triple ping: bypass requested, no saved cal
+// Prompt vocabulary: two-note sequences at the top of the keyboard, well above
+// any handbell. Ascending C8->E8 = ready/waiting; descending E8->C8 = error /
+// play again. Single E8 = bypass gesture recognized (loading).
+static constexpr int    PROMPT_NOTE_C8           = 108;
+static constexpr int    PROMPT_NOTE_E8           = 112;
 static constexpr int    PROMPT_VEL               = 100;
-static constexpr int    PROMPT_DUR_MS            = 150;
-static constexpr int    PROMPT_FAIL_DUR_MS       = 80;  // shorter/faster = reads as "error" by ear
+static constexpr int    PROMPT_DUR_MS            = 250;  // per note of the sequence
 
 enum class SystemPrompt { READY, CAL_BYPASS, CAL_BYPASS_FAILED };
 

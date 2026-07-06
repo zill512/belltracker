@@ -149,17 +149,18 @@ void BellTracker::notify_ready() {
 void BellTracker::post_system_prompt(SystemPrompt p) {
     switch (p) {
         case SystemPrompt::READY:
-            post_ping(PROMPT_NOTE_READY, SYSTEM_CHANNEL, PROMPT_VEL, PROMPT_DUR_MS);
+            // ascending C8 -> E8, 250ms each: armed / waiting
+            post_ping(PROMPT_NOTE_C8, SYSTEM_CHANNEL, PROMPT_VEL, PROMPT_DUR_MS);
+            post_ping(PROMPT_NOTE_E8, SYSTEM_CHANNEL, PROMPT_VEL, PROMPT_DUR_MS);
             break;
         case SystemPrompt::CAL_BYPASS:
-            post_ping(PROMPT_NOTE_BYPASS, SYSTEM_CHANNEL, PROMPT_VEL, PROMPT_DUR_MS);
+            // single E8: damped strike recognized, loading saved cal
+            post_ping(PROMPT_NOTE_E8, SYSTEM_CHANNEL, PROMPT_VEL, PROMPT_DUR_MS);
             break;
         case SystemPrompt::CAL_BYPASS_FAILED:
-            // triple rapid ping — deliberately reads as "error" by ear, distinct
-            // from every single-ping success cue elsewhere in the system
-            for (int i = 0; i < 3; ++i)
-                post_ping(PROMPT_NOTE_BYPASS_FAIL, SYSTEM_CHANNEL, PROMPT_VEL,
-                           PROMPT_FAIL_DUR_MS);
+            // descending E8 -> C8, 250ms each: error / play again
+            post_ping(PROMPT_NOTE_E8, SYSTEM_CHANNEL, PROMPT_VEL, PROMPT_DUR_MS);
+            post_ping(PROMPT_NOTE_C8, SYSTEM_CHANNEL, PROMPT_VEL, PROMPT_DUR_MS);
             break;
     }
 }
@@ -623,37 +624,45 @@ float BellTracker::yin_fundamental(const float* buf, int len, float sr) {
 
 // ── build_nmf_templates ──────────────────────────────────────────────────────
 void BellTracker::build_nmf_templates() {
-    printf("\n  Building NMF templates...\n");
-    const int N = TEMPLATE_FFT_SIZE;
-    std::vector<float> re(N), im(N);
-
+    printf("\n  Building NMF templates (Goertzel domain)...\n");
+    // Templates MUST live in the same measurement domain as the perf-phase
+    // observation vector V, i.e. the GOERTZEL_WINDOW-sample Goertzel bank —
+    // not a long FFT. A 32768-point FFT resolves 1.46Hz, so FFT templates were
+    // near-perfectly diagonal, while V is smeared by the bank's ~47Hz
+    // bandwidth; deconvolving smeared V against diagonal T degenerated to
+    // H≈V and closely spaced bells never crossed NMF_THRESHOLD. Here each
+    // template is the bank's own averaged response to that bell's cal capture
+    // (sustain region, same transient skip as pitch analysis), so T models the
+    // smearing and the multiplicative updates genuinely un-mix neighbors.
     for (int i = 0; i < n_bells_; ++i) {
-        std::fill(re.begin(), re.end(), 0.0f);
-        std::fill(im.begin(), im.end(), 0.0f);
-        int copy_len = std::min((int)bells_[i].cal_buf.size(), N);
-        for (int s = 0; s < copy_len; ++s) re[s] = bells_[i].cal_buf[s];
-        for (int s = 0; s < copy_len; ++s) {
-            float w = 0.5f * (1.0f - cosf(2.0f * M_PI * s / (copy_len - 1)));
-            re[s] *= w;
-        }
-        radix2_fft(re.data(), im.data(), N);
+        const std::vector<float>& buf = bells_[i].cal_buf;
+        int len   = (int)buf.size();
+        int pre   = len - CAL_CAPTURE_SAMP;
+        int start = std::max(0, pre + (int)(PITCH_SKIP_MS * 0.001f * SAMPLE_RATE));
+        if (len - start < GOERTZEL_WINDOW)                 // very short capture
+            start = std::max(0, len - GOERTZEL_WINDOW);
 
-        bells_[i].nmf_template.resize(n_bells_, 0.0f);
-        float tmpl_sum = 0.0f;
-        for (int k = 0; k < n_bells_; ++k) {
-            int bin = (int)roundf(bells_[k].freq_hz * N / SAMPLE_RATE);
-            bin = std::max(0, std::min(N/2 - 1, bin));
-            float mag2 = re[bin]*re[bin] + im[bin]*im[bin];
-            bells_[i].nmf_template[k] = mag2;
-            tmpl_sum += mag2;
+        bells_[i].nmf_template.assign(n_bells_, 0.0f);
+        int nwin = 0;
+        for (int w0 = start; w0 + GOERTZEL_WINDOW <= len; w0 += GOERTZEL_WINDOW) {
+            for (int k = 0; k < n_bells_; ++k) {
+                GoertzelState g;
+                g.init(bells_[k].freq_hz, GOERTZEL_WINDOW);
+                for (int t = 0; t < GOERTZEL_WINDOW; ++t) g.feed(buf[w0 + t]);
+                bells_[i].nmf_template[k] += g.power();
+            }
+            ++nwin;
         }
+
+        float tmpl_sum = 0.0f;
+        for (int k = 0; k < n_bells_; ++k) tmpl_sum += bells_[i].nmf_template[k];
         if (tmpl_sum > 1e-12f)
             for (int k = 0; k < n_bells_; ++k)
                 bells_[i].nmf_template[k] /= tmpl_sum;
 
         const char* ts = (bells_[i].type == InstrumentType::BELL) ? "bell" : "chime";
-        printf("    [%5s] Bell %2d %.1f Hz  self=%.3f\n",
-               ts, i+1, bells_[i].freq_hz, bells_[i].nmf_template[i]);
+        printf("    [%5s] Bell %2d %.1f Hz  windows=%d  self=%.3f\n",
+               ts, i+1, bells_[i].freq_hz, nwin, bells_[i].nmf_template[i]);
 
         bells_[i].cal_buf.clear();
         bells_[i].cal_buf.shrink_to_fit();
@@ -811,6 +820,7 @@ void BellTracker::midi_note_on(int note, int channel, int vel) {
     snd_seq_ev_set_source(&ev, seq_port_);
     snd_seq_ev_set_subs(&ev);
     snd_seq_ev_set_direct(&ev);
+    if (FORCE_MIDI_CHANNEL >= 0) channel = FORCE_MIDI_CHANNEL;
     snd_seq_ev_set_noteon(&ev, channel & 0xF, note, vel);
     snd_seq_event_output_direct(seq_, &ev);
 }
@@ -822,6 +832,7 @@ void BellTracker::midi_note_off(int note, int channel) {
     snd_seq_ev_set_source(&ev, seq_port_);
     snd_seq_ev_set_subs(&ev);
     snd_seq_ev_set_direct(&ev);
+    if (FORCE_MIDI_CHANNEL >= 0) channel = FORCE_MIDI_CHANNEL;
     snd_seq_ev_set_noteoff(&ev, channel & 0xF, note, 0);
     snd_seq_event_output_direct(seq_, &ev);
 }
@@ -833,6 +844,7 @@ void BellTracker::midi_program_change(int channel, int program) {
     snd_seq_ev_set_source(&ev, seq_port_);
     snd_seq_ev_set_subs(&ev);
     snd_seq_ev_set_direct(&ev);
+    if (FORCE_MIDI_CHANNEL >= 0) channel = FORCE_MIDI_CHANNEL;
     snd_seq_ev_set_pgmchange(&ev, channel & 0xF, program & 0x7F);
     snd_seq_event_output(seq_, &ev);
     snd_seq_drain_output(seq_);
@@ -868,7 +880,7 @@ void BellTracker::send_program_changes() {
 // thread from finalize_cal; load: init(), before JACK is activated).
 //
 // File layout:
-//   BELLTRACKER_CAL_V1
+//   BELLTRACKER_CAL_V2
 //   n_bells=<N>
 //   [bell]
 //   idx=<i>
@@ -921,7 +933,7 @@ void BellTracker::save_cal_to_file(const std::string& path,
         return;
     }
     f << std::setprecision(9);
-    f << "BELLTRACKER_CAL_V1\n";
+    f << "BELLTRACKER_CAL_V2\n";
     f << "n_bells=" << n_bells_snapshot << "\n";
     for (int i = 0; i < n_bells_snapshot; ++i) {
         const BellData& b = snapshot[i];
@@ -956,7 +968,13 @@ bool BellTracker::load_cal_from_file(const std::string& path) {
     while (std::getline(f, line)) lines.push_back(line);
     f.close();
 
-    if (lines.empty() || lines[0] != "BELLTRACKER_CAL_V1") {
+    if (!lines.empty() && lines[0] == "BELLTRACKER_CAL_V1") {
+        fprintf(stderr, "belltracker: %s is V1 (FFT-domain templates, "
+                "incompatible with Goertzel-domain matching) — recalibrate\n",
+                path.c_str());
+        return false;
+    }
+    if (lines.empty() || lines[0] != "BELLTRACKER_CAL_V2") {
         fprintf(stderr, "belltracker: %s is not a valid cal file\n", path.c_str());
         return false;
     }

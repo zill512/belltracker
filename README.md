@@ -160,21 +160,33 @@ Triggered by:
 
 ### Goertzel filter bank
 
-One filter per registered bell, tuned to that bell's calibrated fundamental. Fed every sample. Every `GOERTZEL_WINDOW` (128 samples, ~2.7ms) the energy vector `V[n_bells]` is snapshotted and the filters reset.
+One Goertzel filter per registered bell, tuned to its measured fundamental,
+evaluated every `GOERTZEL_WINDOW` = 1024 samples (21.3ms, ~47Hz bandwidth).
+The window size is a detection-resolution/latency tradeoff: 128 samples
+(375Hz bandwidth) made semitone-adjacent bells spectrally indistinguishable
+to the bank.
 
 ### Iterative NMF deconvolution
 
-`V ≈ T·H` is solved for the activation vector `H` via `NMF_ITERS` (4) Lee-Seung multiplicative-update iterations:
+Each window, the bank yields the observation vector **V** (per-bell-frequency
+power). Solve V ≈ T·H for activations H via `NMF_ITERS` = 15 Lee-Seung
+multiplicative updates, warm-started from the previous window. The template
+Gram matrix T·Tᵀ is precomputed on the first perf window.
 
-```
-H[b] ← H[b] · (T^T V)[b] / (T^T T H)[b]
-```
+**Templates live in the Goertzel domain** — each bell's template is the same
+1024-sample Goertzel bank's averaged response to that bell's cal capture
+(sustain region, transient skipped). This is load-bearing: templates built
+from a long FFT (1.46Hz bins) are near-diagonal, while V is smeared by the
+bank's ~47Hz bandwidth; deconvolving smeared observations against diagonal
+templates degenerates to H≈V, and closely spaced bell sets never cross
+threshold (v1.2's original silent-perf bug). Matching domains lets the
+updates genuinely un-mix neighbors — simulation-verified against 12 chromatic
+bells from C4, soft and hard strikes, singles and chords.
 
-The template Gram matrix (`T^T·T`) is invariant after calibration, so it is built once lazily on the first perf window (`build_nmf_gram()`) rather than recomputed every 2.7ms.
+Normalized activation `Hn = H[b]/ΣV` crosses `NMF_THRESHOLD` (0.25) → note-on.
 
-`H` is warm-started from `BellData::h_nmf` (previous window's converged value) since bells sustain across many windows — reduces iterations needed and keeps continuity between windows.
-
-**Why iterative NMF instead of a cosine projection:** the old single-step approach (`H[b] = dot(V, template_b) / (||template_b|| · total_energy)`) works for isolated strikes. For simultaneous onsets, two bells' real spectral templates share energy in overlapping Goertzel bins, inflating each bell's score by leakage from the other. Multiplicative-update NMF properly deconvolves overlapping templates, giving each bell its individual activation even in a chord.
+**Cal file format is V2** — V1 files carry FFT-domain templates and are
+rejected with a recalibrate message.
 
 ### Note-on / note-off
 
@@ -202,15 +214,17 @@ FluidSynth *and* the DIN out — so external synths switch patch too.
 
 ### Headless status prompts
 
-| Event | Channel | Note | Pattern | Meaning |
-|---|---|---|---|---|
-| Startup | 15 | 1 | Single ping, 150ms. Repeats every 5s (`READY_PING_INTERVAL_S`) until the first strike | Audio connected, armed — waiting for cal or bypass gesture |
-| Bell registered | Bell's channel | Bell's note | 1s delay, then 3× at arpeggio timing (400ms on / 100ms gap) | Bell confirmed |
-| Cal-complete / bypass success | Each bell's channel | Each bell's note | Sequential arpeggio, 0.5s onset-to-onset | Cal complete — entering PERF |
-| Bypass recognized | 15 | 2 | Single ping, 150ms, after 1s delay | Damped strike accepted, loading saved data |
-| Bypass failed | 15 | 3 | Three rapid pings, 80ms each | No saved cal data found — continuing CAL |
+| Event | Note(s) | Pattern | Meaning |
+|---|---|---|---|
+| Startup / waiting | C8 → E8 | Ascending pair, 250ms each; repeats every 5s until first strike | Audio connected, armed |
+| Bell registered | Bell's note | 1s delay, then 3× at arpeggio timing | Bell confirmed |
+| Cal-complete / bypass success | Each bell's note | Sequential arpeggio, 0.5s onset-to-onset | Entering PERF |
+| Bypass recognized | E8 | Single, 250ms, after 1s delay | Damped strike accepted, loading |
+| Error / play again (bypass failed) | E8 → C8 | Descending pair, 250ms each | No saved cal — continuing CAL |
 
-The triple-ping error pattern is intentionally different in rhythm, not just pitch, so it reads as "error" without needing to identify notes.
+Ascending = OK, descending = error — direction carries the meaning, no pitch identification needed. C8/E8 sit above any handbell.
+
+**TEMPORARY:** `FORCE_MIDI_CHANNEL = 0` routes every outgoing event (bells, prompts, PCs) to MIDI channel 1 at the output layer. Per-bell channels, the cal-file `channel=` field, and `--channel` remain functional upstream; set the constant to -1 to restore per-bell routing.
 
 ---
 

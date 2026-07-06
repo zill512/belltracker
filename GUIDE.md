@@ -140,11 +140,13 @@ sox --ignore-length perf_001.wav perf_001_fixed.wav
 
 | What you hear | When | Meaning |
 |---|---|---|
-| Single short ping, repeating every 5 seconds | At startup, before anything is struck | System armed, waiting |
+| Two rising notes (low-high), repeating every 5 seconds | At startup, before anything is struck | System armed, waiting |
 | That bell's note, played 3 times, about 1 second after a strike | During calibration, after each bell | Bell registered successfully |
 | Every bell's note in sequence, one at a time | At the end of calibration | Performance mode active |
-| Single ping, about 1 second after a grasp strike | Skip-cal gesture | Loading previous session's data |
-| Three rapid pings | After skip-cal attempt | No saved data found — calibrate normally |
+| One high note, about 1 second after a grasp strike | Skip-cal gesture | Loading previous session's data |
+| Two falling notes (high-low) | After skip-cal attempt | No saved data — calibrate normally |
+
+Rising = OK. Falling = try again.
 
 ---
 
